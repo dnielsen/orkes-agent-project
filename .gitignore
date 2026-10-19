@@ -1,0 +1,9 @@
+# video-pipeline local state
+video-pipeline/.venv/
+video-pipeline/.bin/
+video-pipeline/.run/
+video-pipeline/sample/out/
+__pycache__/
+*.db
+*.db-shm
+*.db-wal

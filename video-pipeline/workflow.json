@@ -1,0 +1,185 @@
+{
+  "name": "video_dialogue_pipeline",
+  "description": "Take a video file, encode it into several formats in parallel, extract its dialogue (embedded subtitles or speech-to-text) and summarize it with an LLM.",
+  "version": 1,
+  "schemaVersion": 2,
+  "ownerEmail": "dnielsen@gmail.com",
+  "restartable": true,
+  "timeoutPolicy": "TIME_OUT_WF",
+  "timeoutSeconds": 21600,
+  "inputParameters": ["videoPath", "outputDir", "formats", "dialogueSource", "language", "whisperModel", "llmProvider", "model"],
+  "inputTemplate": {
+    "dialogueSource": "auto",
+    "llmProvider": "anthropic",
+    "model": "claude-sonnet-5-5",
+    "formats": [
+      {"name": "h264_720p", "ext": "mp4", "videoCodec": "libx264", "audioCodec": "aac", "height": 720},
+      {"name": "hevc_1080p", "ext": "mp4", "videoCodec": "libx265", "audioCodec": "aac", "height": 1080},
+      {"name": "vp9_480p", "ext": "webm", "videoCodec": "libvpx-vp9", "audioCodec": "libopus", "height": 480, "audioBitrate": "96k"}
+    ]
+  },
+  "tasks": [
+    {
+      "name": "probe_video",
+      "taskReferenceName": "probe",
+      "type": "SIMPLE",
+      "inputParameters": {"videoPath": "${workflow.input.videoPath}"}
+    },
+    {
+      "name": "plan_encodes",
+      "taskReferenceName": "plan_encodes",
+      "type": "JSON_JQ_TRANSFORM",
+      "inputParameters": {
+        "formats": "${workflow.input.formats}",
+        "videoPath": "${probe.output.videoPath}",
+        "outputDir": "${workflow.input.outputDir}",
+        "queryExpression": ". as $in | ($in.formats[:10]) as $f | {tasks: [$f[] | {name: \"transcode_video\", taskReferenceName: (\"encode_\" + .name), type: \"SIMPLE\"}], inputs: ([$f[] | {key: (\"encode_\" + .name), value: {videoPath: $in.videoPath, outputDir: $in.outputDir, format: .}}] | from_entries)}"
+      }
+    },
+    {
+      "name": "encode_and_extract",
+      "taskReferenceName": "encode_and_extract",
+      "type": "FORK_JOIN",
+      "forkTasks": [
+        [
+          {
+            "name": "encode_formats",
+            "taskReferenceName": "encode_formats",
+            "type": "FORK_JOIN_DYNAMIC",
+            "dynamicForkTasksParam": "dynamicTasks",
+            "dynamicForkTasksInputParamName": "dynamicTasksInput",
+            "inputParameters": {
+              "dynamicTasks": "${plan_encodes.output.result.tasks}",
+              "dynamicTasksInput": "${plan_encodes.output.result.inputs}"
+            }
+          },
+          {
+            "name": "encode_join",
+            "taskReferenceName": "encode_join",
+            "type": "JOIN"
+          }
+        ],
+        [
+          {
+            "name": "choose_dialogue_source",
+            "taskReferenceName": "dialogue_source",
+            "type": "SWITCH",
+            "evaluatorType": "graaljs",
+            "expression": "(function(){ var m = $.mode || 'auto'; if (m == 'subtitles' && $.subCount > 0) return 'subtitles'; if (m == 'asr' && $.hasAudio) return 'asr'; if (m != 'auto') return 'none'; if ($.subCount > 0) return 'subtitles'; return $.hasAudio ? 'asr' : 'none'; })()",
+            "inputParameters": {
+              "mode": "${workflow.input.dialogueSource}",
+              "subCount": "${probe.output.subtitleStreamCount}",
+              "hasAudio": "${probe.output.hasAudio}"
+            },
+            "decisionCases": {
+              "subtitles": [
+                {
+                  "name": "extract_subtitles",
+                  "taskReferenceName": "subtitles",
+                  "type": "SIMPLE",
+                  "inputParameters": {
+                    "videoPath": "${probe.output.videoPath}",
+                    "outputDir": "${workflow.input.outputDir}",
+                    "streamIndex": 0
+                  }
+                }
+              ],
+              "asr": [
+                {
+                  "name": "extract_audio",
+                  "taskReferenceName": "audio",
+                  "type": "SIMPLE",
+                  "inputParameters": {
+                    "videoPath": "${probe.output.videoPath}",
+                    "outputDir": "${workflow.input.outputDir}"
+                  }
+                },
+                {
+                  "name": "transcribe_audio",
+                  "taskReferenceName": "transcribe",
+                  "type": "SIMPLE",
+                  "inputParameters": {
+                    "audioPath": "${audio.output.audioPath}",
+                    "language": "${workflow.input.language}",
+                    "model": "${workflow.input.whisperModel}"
+                  }
+                }
+              ]
+            },
+            "defaultCase": []
+          },
+          {
+            "name": "build_transcript",
+            "taskReferenceName": "transcript",
+            "type": "JSON_JQ_TRANSFORM",
+            "inputParameters": {
+              "fromSubtitles": "${subtitles.output}",
+              "fromAsr": "${transcribe.output}",
+              "fileName": "${probe.output.fileName}",
+              "durationSec": "${probe.output.durationSec}",
+              "queryExpression": "def int: tostring | split(\".\")[0]; def pad: int | if length < 2 then \"0\" + . else . end; def ts: floor as $s | ($s / 3600 | floor) as $h | (($s - $h * 3600) / 60 | floor) as $m | ($h | int) + \":\" + ($m | pad) + \":\" + (($s - $h * 3600 - $m * 60) | pad); (.fromSubtitles // .fromAsr // {source: \"none\", segments: []}) as $t | ($t.segments // []) as $seg | {source: $t.source, language: $t.language, transcriptPath: $t.transcriptPath, segmentCount: ($seg | length), text: ([$seg[] | \"[\" + (.start | ts) + \"] \" + .text] | join(\"\\n\")), prompt: (\"Video: \" + .fileName + \" (\" + ((.durationSec // 0) | ts) + \" long)\\nDialogue source: \" + ($t.source // \"none\") + \"\\n\\nTranscript:\\n\" + ([$seg[] | \"[\" + (.start | ts) + \"] \" + .text] | join(\"\\n\")))}"
+            }
+          },
+          {
+            "name": "summarize_if_dialogue",
+            "taskReferenceName": "summary_gate",
+            "type": "SWITCH",
+            "evaluatorType": "graaljs",
+            "expression": "$.segmentCount > 0 ? 'summarize' : 'skip'",
+            "inputParameters": {"segmentCount": "${transcript.output.result.segmentCount}"},
+            "decisionCases": {
+              "summarize": [
+                {
+                  "name": "summarize_dialogue",
+                  "taskReferenceName": "summarize",
+                  "type": "LLM_CHAT_COMPLETE",
+                  "inputParameters": {
+                    "llmProvider": "${workflow.input.llmProvider}",
+                    "model": "${workflow.input.model}",
+                    "temperature": 0.2,
+                    "maxTokens": 2000,
+                    "messages": [
+                      {
+                        "role": "system",
+                        "message": "You summarize the dialogue of videos from a timestamped transcript. Be faithful to the transcript: do not invent speakers, facts or events. Transcripts may contain recognition errors; infer the intended words only when obvious. Respond in Markdown with these sections: '## Overview' (2-4 sentences), '## Key points' (bullets, each citing a [h:mm:ss] timestamp), '## Speakers & tone' (only what the transcript supports), '## Notable quotes' (up to 3, verbatim), '## Action items / open questions' (or 'None')."
+                      },
+                      {"role": "user", "message": "${transcript.output.result.prompt}"}
+                    ]
+                  }
+                }
+              ]
+            },
+            "defaultCase": []
+          }
+        ]
+      ]
+    },
+    {
+      "name": "encode_and_extract_join",
+      "taskReferenceName": "encode_and_extract_join",
+      "type": "JOIN",
+      "joinOn": ["encode_join", "summary_gate"]
+    },
+    {
+      "name": "collect_results",
+      "taskReferenceName": "results",
+      "type": "JSON_JQ_TRANSFORM",
+      "inputParameters": {
+        "encodes": "${encode_join.output}",
+        "queryExpression": "{encodings: ([.encodes | to_entries[] | .value] | sort_by(.format))}"
+      }
+    }
+  ],
+  "outputParameters": {
+    "source": "${probe.output}",
+    "encodings": "${results.output.result.encodings}",
+    "dialogue": {
+      "source": "${transcript.output.result.source}",
+      "language": "${transcript.output.result.language}",
+      "segmentCount": "${transcript.output.result.segmentCount}",
+      "transcriptPath": "${transcript.output.result.transcriptPath}",
+      "transcript": "${transcript.output.result.text}"
+    },
+    "summary": "${summarize.output.result}"
+  }
+}

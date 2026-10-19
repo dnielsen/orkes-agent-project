@@ -1,0 +1,59 @@
+# Orkes Enterprise Features
+
+Webhooks and the managed secret store (with the `conductor secret` CLI) require Orkes Conductor (orkes.io). **`${workflow.secrets.X}` itself is not Orkes-only any more**: OSS Conductor resolves it from `CONDUCTOR_SECRET_X` environment variables on the server (`conductor.secrets.type=env`, the default), and servers with the agent runtime expose the store at `/api/secrets` (UI `/agentSecrets`) for agent `credentials=[...]` — see [agents.md](agents.md) §8. The Python fallback script has no secret commands.
+
+**AI providers on Orkes are integrations**, not server env vars: create the integration, register its models, grant access, and put the integration *name* in `llmProvider` — see [orkes-integrations.md](orkes-integrations.md).
+
+> Schedules used to live here — they're now part of OSS. See [schedules.md](schedules.md).
+
+Auth is the same as the rest of the CLI — see [setup.md](setup.md) (key/secret recommended).
+
+## Secrets
+
+Securely store values referenced from workflows (e.g. API keys). Reference in tasks via `${workflow.secrets.MY_KEY}` (and `${workflow.secrets.MY_KEY.sub_key}` when the secret holds a JSON object). On OSS the equivalent is `export CONDUCTOR_SECRET_MY_KEY=...` in the server's environment.
+
+```bash
+conductor secret list
+conductor secret get {key}
+conductor secret put {key} {value}
+conductor secret delete {key}
+```
+
+**Important: secret values are resolved server-side at task execution time**, not by the agent, the CLI, or the workflow definition. The reference `${workflow.secrets.MY_KEY}` lives in the workflow JSON; the actual value is substituted by the Conductor server when the task runs. This means:
+
+- The plaintext secret never appears in the workflow definition, the execution view, or any agent transcript.
+- Rotating a secret on the server affects every running and future workflow without redeploying any definition.
+- Workers and HTTP tasks receive the substituted value at runtime via task inputs.
+
+Never echo secret values in agent output. After `put`, confirm with name only (e.g. via `conductor secret list`).
+
+## Webhooks
+
+Trigger workflows from external HTTP callbacks (Stripe, GitHub, custom services).
+
+```bash
+conductor webhook list
+conductor webhook get {name}
+conductor webhook create webhook.json
+conductor webhook update webhook.json
+conductor webhook delete {name}
+```
+
+Example `webhook.json`:
+
+```json
+{
+  "name": "github-pr-events",
+  "verifier": "HEADER_BASED",
+  "headers": { "X-Hub-Signature-256": "${secrets.GITHUB_WEBHOOK_SIG}" },
+  "receiverWorkflowNamesToVersions": { "github_pr_handler": 1 },
+  "sourcePlatform": "Custom"
+}
+```
+
+After creation the CLI returns a webhook URL — give that to the user (don't fabricate one).
+
+## Notes
+
+- Enterprise commands fail on OSS Conductor with a `404` or `Not Found`. Check the flavor with `python3 "$CONDUCTOR_API" server-info` (auth required = Enterprise, none = OSS) before using them. (`conductor secret` may also answer on an OSS server with the agent runtime, but `put` returns 501 when the backend is env-backed and read-only.)
+- For dev against Orkes, [developer.orkescloud.com](https://developer.orkescloud.com) is the public developer sandbox.

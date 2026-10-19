@@ -1,0 +1,49 @@
+[
+  {
+    "name": "probe_video",
+    "description": "ffprobe the input video: validate it and report stream metadata",
+    "retryCount": 2, "retryLogic": "EXPONENTIAL_BACKOFF", "retryDelaySeconds": 5,
+    "responseTimeoutSeconds": 120, "timeoutSeconds": 300, "timeoutPolicy": "TIME_OUT_WF",
+    "pollTimeoutSeconds": 600,
+    "inputKeys": ["videoPath"],
+    "ownerEmail": "dnielsen@gmail.com"
+  },
+  {
+    "name": "transcode_video",
+    "description": "Encode the video into one target format with ffmpeg",
+    "retryCount": 2, "retryLogic": "EXPONENTIAL_BACKOFF", "retryDelaySeconds": 30,
+    "responseTimeoutSeconds": 7200, "timeoutSeconds": 10800, "timeoutPolicy": "TIME_OUT_WF",
+    "pollTimeoutSeconds": 3600,
+    "concurrentExecLimit": 4,
+    "inputKeys": ["videoPath", "outputDir", "format"],
+    "ownerEmail": "dnielsen@gmail.com"
+  },
+  {
+    "name": "extract_subtitles",
+    "description": "Extract an embedded text subtitle track as SRT and parse dialogue segments",
+    "retryCount": 2, "retryLogic": "EXPONENTIAL_BACKOFF", "retryDelaySeconds": 5,
+    "responseTimeoutSeconds": 600, "timeoutSeconds": 900, "timeoutPolicy": "TIME_OUT_WF",
+    "pollTimeoutSeconds": 600,
+    "inputKeys": ["videoPath", "outputDir", "streamIndex"],
+    "ownerEmail": "dnielsen@gmail.com"
+  },
+  {
+    "name": "extract_audio",
+    "description": "Extract a 16 kHz mono WAV for speech-to-text",
+    "retryCount": 2, "retryLogic": "EXPONENTIAL_BACKOFF", "retryDelaySeconds": 5,
+    "responseTimeoutSeconds": 1800, "timeoutSeconds": 3600, "timeoutPolicy": "TIME_OUT_WF",
+    "pollTimeoutSeconds": 600,
+    "inputKeys": ["videoPath", "outputDir"],
+    "ownerEmail": "dnielsen@gmail.com"
+  },
+  {
+    "name": "transcribe_audio",
+    "description": "Speech-to-text with faster-whisper; returns timestamped dialogue segments",
+    "retryCount": 1, "retryLogic": "FIXED", "retryDelaySeconds": 30,
+    "responseTimeoutSeconds": 7200, "timeoutSeconds": 10800, "timeoutPolicy": "TIME_OUT_WF",
+    "pollTimeoutSeconds": 3600,
+    "concurrentExecLimit": 2,
+    "inputKeys": ["audioPath", "language", "model"],
+    "ownerEmail": "dnielsen@gmail.com"
+  }
+]

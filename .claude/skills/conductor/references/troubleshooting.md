@@ -1,0 +1,97 @@
+# Troubleshooting & Output
+
+## Output formatting
+
+- Present workflow data as structured summaries: `workflowId`, `status`, `startTime`, `endTime`, failed-task details.
+- For searches, render a table with `workflowId`, `name`, `status`, `startTime`.
+- On failures, include the failed task name, error message, and retry count.
+- Never echo auth tokens, keys, or secrets in output or logs.
+
+## Common errors
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `conductor: command not found` | CLI not installed | Run `npx @conductor-oss/conductor-cli ...`, or ask the user before global install (see [setup.md](setup.md)). If npm itself is missing, fall back to `scripts/conductor_api.py`. |
+| `Connection refused` / `URLError` | Server not running, or wrong URL | Verify `CONDUCTOR_SERVER_URL`. A remote root/UI URL normally needs `/api` appended exactly once. For local servers run `conductor server status`. |
+| `401 Unauthorized` | Missing, incomplete, or invalid auth | Securely inject either `CONDUCTOR_AUTH_TOKEN` or both `CONDUCTOR_AUTH_KEY` + `CONDUCTOR_AUTH_SECRET`; the CLI, SDKs, and Python fallback exchange an Orkes key pair automatically. Never print the values. Re-run `conductor workflow list` to confirm. |
+| `403 Forbidden` | Token valid but lacks permissions | Confirm with the user that the credentials have access to the target workflow/namespace. |
+| `404 Not Found` from `/token` during key/secret auth | Wrong API base or a non-Orkes server | Normalize the Orkes root URL to end in `/api` and set `CONDUCTOR_SERVER_TYPE=Enterprise` for the CLI. Plain OSS servers do not provide the Orkes token-exchange endpoint. |
+| `404 Not Found` | Wrong workflow name, version, or execution ID | Run `conductor workflow list` or `conductor workflow search` to find the correct identifier. |
+| Workflow stuck on a SIMPLE task | No worker polling for that task type | Run `conductor task queue-size --task-type {name}` — if size > 0 and growing, no worker is consuming. Scaffold a worker (see [workers.md](workers.md)). |
+| `409 Conflict` on workflow create | Definition with that name+version already exists | Bump version, or use update instead of create. |
+| 5xx errors | Server-side issue | The fallback script auto-retries 3× with backoff. CLI may need a manual retry. Surface server error to the user. |
+
+## JavaScript / GraalJS errors
+
+These show up in INLINE, DO_WHILE `loopCondition`, or SWITCH with a JS evaluator.
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `TypeError: Cannot read property "variables" from undefined` (or `"input"`) | `$.workflow.variables.X` / `$.workflow.input.X` used inside a script. Workflow inputs/variables are not in scope inside JS. | Plumb the value through `inputParameters` and read as `$.varName`. See [graaljs-gotchas.md](graaljs-gotchas.md) Rule 4. |
+| `$.someVar` is `undefined` at runtime | Variable referenced as `$.x` but missing from `inputParameters`. | Add a matching key. The `$` object is the task's resolved `inputParameters` map. |
+| `loopCondition` always evaluates the same way / loop never exits | `evaluatorType` omitted on DO_WHILE (the implicit-`javascript` alias has been reported to fail in some cluster versions), or `loopCondition` returns a non-boolean value. | Set `evaluatorType: "graaljs"` explicitly at the top of the DO_WHILE task; use an IIFE form like `(function(){ return ... ; })();`. |
+| `${loop.iteration}` resolves to garbage in `outputParameters` | Wrong path — `iteration` lives inside the task's `outputData`. | Use `${loop.output.iteration}`. See [template-resolution.md](template-resolution.md) Pitfall 3. |
+| Downstream string field contains `{key1=value1, key2=value2}` (note `=` separators, no quotes) | A structured object was interpolated into a string-typed field, or `String($.someTaskOutput)` was used in INLINE — both invoke Java's `Map.toString()`. | Stringify with `JSON_JQ_TRANSFORM` and `tojson` upstream. Do **not** try to do this in INLINE — `JSON.stringify` returns `"{}"` and `Object.keys` returns `[]` on Java-Map-backed proxies. See [graaljs-gotchas.md](graaljs-gotchas.md) Rule 3. |
+| `JSON.parse` fails / `catch` returns garbage in an INLINE | Caller wrote `JSON.parse(String($.taskOutput))` defensively, but `$.taskOutput` is already a parsed object. | Drop the `String() + JSON.parse` wrapper. Access fields directly on the parsed object. |
+| Downstream field gets the **wrong** task-output object | `${task.output.path.to.missing}` traversed a non-existent intermediate field. The resolver silently returns the parent object rather than null. | Route on the relevant signal **first** with SWITCH; only access deeper paths in the branch where they exist. See [template-resolution.md](template-resolution.md) Pitfall 1. |
+| INLINE task fails mysteriously after renaming inputs | The input parameter was named `input` or `messages` — empirically these cause obscure failures (collision or reserved-ish). | Rename to e.g. `inputMessages`. See [graaljs-gotchas.md](graaljs-gotchas.md) Rule 5. |
+
+## LLM_CHAT_COMPLETE errors
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| Orkes: *"Prompt … is not associated with integration … and model …"* | Literal text in `instructions` / `promptName` / image `prompt` (Enterprise reads them as saved-template names), or the template isn't associated with that `integration:model` | Reference a saved template by name (`prompt-save --model <integration>:<model>`) or set `allowRawPrompts: true` — [orkes-integrations.md](orkes-integrations.md) §6 |
+| Orkes: LLM task fails with integration/provider not found, model not found, or access denied | `llmProvider` holds the provider *type* instead of an Orkes integration name, the model isn't registered under that integration, or the running application has no access to it | `integration-list` / `model-list` / `access-list` via `$CONDUCTOR_API`; fix per [orkes-integrations.md](orkes-integrations.md) §7 |
+| `Content must not be null for SYSTEM or USER messages` | Used `{role, content}` (Anthropic/OpenAI shape) instead of `{role, message}` (Conductor shape). | Rename `content` → `message` in every message. |
+| Chat history contains `{role=user, message=Hello}` and the LLM replies with nonsense | A structured object was placed in the `message` field; Conductor Java-`toString`'d it on the way to the provider. | Ensure `message` is always a **string**. Stringify structured data upstream with `JSON_JQ_TRANSFORM` + `tojson`. |
+| Task fails with JSON parse error from Jackson when `jsonOutput: true` | The model emitted markdown fences (` ```json ... ``` `) and Conductor's strict parser rejected them. Common with Claude. | Use provider-native structured output (Anthropic tool-use, OpenAI JSON mode), or keep `jsonOutput: false` and substring-extract `{...}` downstream. |
+| SWITCH branches behave weirdly on `output.result.action` | `output.result` is a parsed object when `jsonOutput: true` and a string when `false` — and the LLM occasionally emits a non-JSON reply even with `jsonOutput: true`. | Keep `defaultCase: []` on SWITCH so unrecognized replies don't poison state. Verify which mode is configured. |
+| OpenAI 400 *"Response input messages must contain the word 'json'…"* with `jsonOutput: true` | The word JSON is only in `instructions` (e.g. a saved template), which the Responses API's JSON-mode check ignores | Mention JSON in a `messages` entry too, e.g. *"reply in JSON"* |
+| `jsonOutput: true` quietly returns prose (Anthropic/Claude) | The model wasn't told it needs to emit JSON. Conductor's `@Documented` on `jsonOutput` notes: "Depending on the model you MUST include JSON word as part of the prompt." | Add the word **JSON** to the system or user message. For stricter contracts, also set `outputSchema` — Conductor will retry up to `retryCount` times on schema failure. |
+| `previousResponseId` silently ignored / chain breaks | `previousResponseId` is OpenAI/Azure-only (Responses API). Other providers ignore the field. Mid-chain provider switches also break the chain. | Keep every turn on the same OpenAI/Azure account. For portable chains, accumulate the full `messages` array instead — see [../examples/ai-agent-loop.md](../examples/ai-agent-loop.md). |
+| OpenAI chain works for a while then breaks | `responseId` retention is bounded (currently ~30 days). After that, the upstream forgets the chain and subsequent turns lose context. | For long-lived workflows, fall back to accumulated `messages`. Persist them yourself in `workflow.variables`. |
+| Extended thinking / `thinkingTokenLimit` has no effect | Wrong provider, or model isn't a thinking/reasoning-capable variant. `thinkingTokenLimit` is Anthropic and Gemini; OpenAI uses `reasoningEffort: low\|medium\|high` via the Responses API. | Pick the right knob for the provider, and confirm the chosen model is one of the provider's thinking-capable models. To surface the chain-of-thought, set `reasoningSummary` and read `output.reasoning`. |
+| `webSearch` / `codeInterpreter` returns "feature not supported" | Provider doesn't expose that built-in tool. `webSearch` and `codeInterpreter` work on OpenAI/Anthropic/Gemini; `fileSearchVectorStoreIds` is OpenAI-only; `googleSearchRetrieval` is Gemini-only. | Check the provider matrix in [workflow-definition.md](workflow-definition.md) LLM_CHAT_COMPLETE section. |
+
+## Agent errors (`AGENT` task, deployed agents — see [agents.md](agents.md))
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `AGENT requires 'agentUrl'` on a task meant for a deployed agent | `agentType` omitted (defaults to `a2a`), or the server's agent runtime is disabled so `conductor` is not a known type | Set `agentType: "conductor"`; enable `conductor.integrations.ai.enabled=true` (+ `agentspan.embedded=true`) — `conductor server start` sets both. Check with `conductor agent list`. |
+| `Agent not found` → task FAILED | Not deployed, wrong `name` or `version` | `conductor agent list` / `conductor agent get {name}`; run `runtime.deploy(agent)`. |
+| `AGENT requires 'prompt'` / `... when resuming an execution` → FAILED_WITH_TERMINAL_ERROR | `prompt` missing on start or on resume | Always pass `prompt`; on resume wire the human answer (`${collect_answer_ref.output.answer}`). |
+| `Invalid model format ... Expected 'provider/model'` on deploy/start | Bare model name, or relying on `CONDUCTOR_AGENT_LLM_MODEL` | `model="openai/gpt-4o-mini"` (etc.) explicitly. |
+| First LLM turn fails / `No configuration found for: <provider>` | Provider key not on the server | `python3 "$CONDUCTOR_API" providers-status`; set `OPENAI_API_KEY` etc. in the server environment. |
+| Execution sits IN_PROGRESS forever; a tool task is SCHEDULED | `requiredWorkers` unserved, or a passthrough framework (plain LangChain, Claude Agent SDK) with no `serve()` | Run `runtime.serve(agent)` as a long-lived process (rule F3). `conductor workflow get-execution {executionId} -c` names the stuck task. |
+| `AGENT` task COMPLETED but the answer is empty; output has `waiting: true` | The agent paused at a human gate and the workflow did not branch on it | SWITCH on `${ref.output.waiting}`; inspect `pendingTool`. |
+| Approved via a resume task: verdict wrong, or an extra `<agent>_approval_human_normalizer` LLM task appears | Resume posts `{"result": ...}`; the gate feeds that text to an LLM normalizer to guess approve/deny | `conductor agent respond {executionId} --approve` / `POST /api/agent/{id}/respond {"approved": true}` / SDK `approve()`; check `pendingTool.response_schema` first |
+| Task ends `CANCELED`, agent `state: canceled` | Parent TERMINATE, `CANCEL_AGENT`, or an operator cancel | Expected — cancellation, not an error. |
+| `AGENT exceeded max duration of Ns` → FAILED_WITH_TERMINAL_ERROR | `maxDurationSeconds` reached (default 86400) | Raise the bound or fix the slow tool; the child run was cancelled best-effort. |
+| MCP / OpenAPI tool discovery blocked (connection refused / denied origin) | Outbound allow-list is deny-all | `conductor.ai.outbound.allowed-origins=...`; `conductor.ai.outbound.allow-private-networks=true` for localhost in dev. |
+| `404` on `/api/skills/...` or `/api/a2a/agent/...` | `agentspan.skills.enabled` / `conductor.a2a.server.enabled` unset | Enable them on the server or avoid the skills / A2A-server features. |
+| `conductor deploy` fails: module `agentspan` not found | The CLI command targets a package that does not ship | Use SDK `runtime.deploy()` (Rule 13). |
+| `${workflow.secrets.X}` arrives empty | Secret missing on the server, wrong sub-key, or the task input was externalized to payload storage | OSS: `CONDUCTOR_SECRET_X` env on the server (JSON object for sub-keys); Orkes: secret manager. Keep large inputs out of tasks that reference secrets. |
+| a2a task polls forever despite `pushNotification: true` | `conductor.a2a.callback.url` unset → silent fallback to polling | Configure the callback URL or drop `pushNotification`. |
+
+## Diagnosis flow for failed workflows
+
+1. `conductor workflow get-execution {id} -c` — full task list with statuses.
+2. Identify the failed task (`status: FAILED` or `TIMED_OUT`) and its `reasonForIncompletion`.
+3. Decide:
+   - `TIMED_OUT` with retries remaining → `conductor workflow retry {id}`.
+   - `FAILED_WITH_TERMINAL_ERROR` → not retryable; fix root cause first.
+   - Persistent timeouts → recommend raising `responseTimeoutSeconds` on the task definition.
+4. For an `AGENT` task, the child run is `output.executionId` (a workflow id) — follow the agent triage flow below on it.
+
+## Triage flow for a stuck or failing agent run
+
+1. `conductor agent execution --name {agent} --since 1h [--status FAILED]` — recent runs; `conductor agent get {agent}` for `maxTurns` / `timeoutSeconds`.
+2. `conductor agent status {id}` — `isWaiting: true` + `pendingTool` = a human gate, not a hang: `conductor agent respond {id} --approve|-m` or the parent's HUMAN task.
+3. `conductor workflow get-execution {id} -c` (the id is a workflow id) — a tool task SCHEDULED with no `waiting` = unserved workers: `runtime.serve(agent)` (F3).
+4. `LLM_CHAT_COMPLETE` FAILED → `python3 "$CONDUCTOR_API" providers-status`; `model` must be `provider/model` with that provider `configured: true` (F6).
+5. `conductor agent stream {id}` replays the events (`thinking`, `tool_call`, `tool_result`, `waiting`, `error`, `done`); UI: `/agentExecutions/{id}`.
+
+## Docs
+
+- General Conductor docs: https://orkes.io/content/
+- REST endpoints: see [api-reference.md](api-reference.md)

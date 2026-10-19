@@ -1,0 +1,19 @@
+1
+00:00:01,000 --> 00:00:04,000
+ALICE: Morning, Bob. Did the overnight render farm job finish?
+
+2
+00:00:04,500 --> 00:00:08,000
+BOB: Mostly. Two of the forty shots failed because the texture cache filled up.
+
+3
+00:00:08,500 --> 00:00:12,000
+ALICE: Okay. Can you clear the cache and re-queue just those two before noon?
+
+4
+00:00:12,500 --> 00:00:16,000
+BOB: Sure. I'll also bump the cache size so it doesn't happen again on Friday.
+
+5
+00:00:16,500 --> 00:00:19,500
+ALICE: Great. Send me the final frames for the client review once they're done.
